@@ -39,8 +39,7 @@ jobs:
             libsystemd-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            libcairo2-dev \
-            openvpn3
+            libcairo2-dev
           pip3 install --quiet --break-system-packages meson
           echo "Dependency installation complete"
 
@@ -97,8 +96,7 @@ jobs:
             libgtk-3-0 \
             libsystemd0 \
             libayatana-appindicator3-1 \
-            libcairo2 \
-            openvpn3
+            libcairo2
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -178,8 +176,7 @@ jobs:
             libsystemd-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            libcairo2-dev \
-            openvpn3
+            libcairo2-dev
           pip3 install --quiet --break-system-packages meson
           echo "Dependency installation complete"
 
@@ -236,8 +233,7 @@ jobs:
             libgtk-3-0 \
             libsystemd0 \
             libayatana-appindicator3-1 \
-            libcairo2 \
-            openvpn3
+            libcairo2
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -317,8 +313,7 @@ jobs:
             libsystemd-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            libcairo2-dev \
-            openvpn3
+            libcairo2-dev
           pip3 install --quiet --break-system-packages meson
 
       - name: Build debug version
@@ -362,8 +357,7 @@ jobs:
             libsystemd-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            libcairo2-dev \
-            openvpn3
+            libcairo2-dev
           pip3 install --quiet --break-system-packages meson
 
       - name: Build debug version
