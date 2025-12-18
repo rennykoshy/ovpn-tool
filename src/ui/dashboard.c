@@ -27,29 +27,11 @@ struct Dashboard {
     GtkWidget *servers_tab;
     GtkWidget *routing_tab;
     GtkWidget *security_tab;
-    /* Statistics widgets */
-    GtkWidget *stats_session_combo;    /* Dropdown to select which session to monitor */
-    GtkWidget *stats_duration_label;
-    GtkWidget *stats_upload_label;
-    GtkWidget *stats_download_label;
-    GtkWidget *stats_total_uploaded_label;
-    GtkWidget *stats_total_downloaded_label;
-    GtkWidget *stats_total_combined_label;
-    GtkWidget *stats_packets_sent_label;
-    GtkWidget *stats_packets_received_label;
-    GtkWidget *stats_packets_errors_label;
-    GtkWidget *stats_packets_dropped_label;
-    GtkWidget *stats_protocol_label;
-    GtkWidget *stats_cipher_label;
-    GtkWidget *stats_server_label;
-    GtkWidget *stats_local_ip_label;
-    GtkWidget *stats_gateway_label;
-    GtkWidget *stats_graph_area;  /* Drawing area for bandwidth graph */
-    GtkWidget *stats_content_box;  /* Container for all statistics content (shown when connected) */
+    /* Statistics widgets - card-based view */
+    GtkWidget *stats_flowbox;      /* FlowBox container for stat cards */
     GtkWidget *stats_empty_state;  /* Empty state widget (shown when disconnected) */
-    /* Bandwidth monitor (for first active session) */
-    BandwidthMonitor *bandwidth_monitor;
-    char *current_device;
+    /* Bandwidth monitors - one per session (hash table: session_path -> BandwidthMonitor) */
+    GHashTable *bandwidth_monitors;
     /* Servers tab instance */
     ServersTab *servers_tab_instance;
     sd_bus *bus;
@@ -59,12 +41,10 @@ struct Dashboard {
 static void on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer data);
 static void on_disconnect_clicked(GtkButton *button, gpointer data);
 static void on_connect_clicked(GtkButton *button, gpointer data);
-static void on_export_stats_clicked(GtkButton *button, gpointer data);
-static void on_reset_stats_clicked(GtkButton *button, gpointer data);
-static void on_session_combo_changed(GtkComboBox *combo, gpointer data);
 static void create_session_card(Dashboard *dashboard, VpnSession *session);
 static void create_config_card(Dashboard *dashboard, VpnConfig *config);
 static void create_import_config_row(Dashboard *dashboard);
+static GtkWidget* create_vpn_stat_card(Dashboard *dashboard, VpnSession *session, BandwidthMonitor *monitor);
 
 /**
  * Format elapsed time
@@ -201,249 +181,441 @@ static int get_interface_gateway(const char *device_name, char *gw_buffer, size_
 }
 
 /**
- * Draw bandwidth graph
+ * Draw sparkline graph for stat card (compact version without axes)
  */
-static gboolean on_stats_graph_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
-    Dashboard *dashboard = (Dashboard *)data;
+static gboolean on_card_graph_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+    BandwidthMonitor *monitor = (BandwidthMonitor *)data;
     int width = gtk_widget_get_allocated_width(widget);
     int height = gtk_widget_get_allocated_height(widget);
-    const int left_margin = 60;  /* Space for Y-axis labels */
-    const int top_margin = 20;   /* Space for legend */
-    const int bottom_margin = 5;
-    const int right_margin = 5;
+    const int margin = 5;
 
-    /* Background - white for clean look */
-    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    /* Background */
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.02);
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
 
-    /* Draw legend at top */
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10);
-
-    /* Download legend (vibrant green) */
-    cairo_set_source_rgb(cr, 0.2, 0.8, 0.4);
-    cairo_rectangle(cr, left_margin, 5, 15, 10);
-    cairo_fill(cr);
-    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-    cairo_move_to(cr, left_margin + 20, 13);
-    cairo_show_text(cr, "Download");
-
-    /* Upload legend (vibrant blue) */
-    cairo_set_source_rgb(cr, 0.2, 0.5, 0.95);
-    cairo_rectangle(cr, left_margin + 100, 5, 15, 10);
-    cairo_fill(cr);
-    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-    cairo_move_to(cr, left_margin + 120, 13);
-    cairo_show_text(cr, "Upload");
-
-    /* Get bandwidth samples */
-    if (!dashboard->bandwidth_monitor) {
+    if (!monitor) {
         return TRUE;
     }
 
+    /* Get bandwidth samples (last 60 seconds for sparkline) */
     BandwidthSample samples[60];
     unsigned int sample_count = 0;
-    if (bandwidth_monitor_get_samples(dashboard->bandwidth_monitor, samples, 60, &sample_count) < 0) {
-        return TRUE;
-    }
-
-    if (sample_count < 2) {
+    if (bandwidth_monitor_get_samples(monitor, samples, 60, &sample_count) < 0 || sample_count < 2) {
+        /* Draw a flat line at zero when no data */
+        cairo_set_source_rgba(cr, 0.2, 0.8, 0.4, 0.3);
+        cairo_move_to(cr, margin, margin + (height - 2 * margin) / 2);
+        cairo_line_to(cr, width - margin, margin + (height - 2 * margin) / 2);
+        cairo_stroke(cr);
         return TRUE;
     }
 
     /* Find max rate for scaling */
     double max_rate = 0.0;
     for (unsigned int i = 0; i < sample_count - 1; i++) {
-        double upload_rate = (samples[i].bytes_out - samples[i+1].bytes_out) /
-                            (double)(samples[i].timestamp - samples[i+1].timestamp);
-        double download_rate = (samples[i].bytes_in - samples[i+1].bytes_in) /
-                              (double)(samples[i].timestamp - samples[i+1].timestamp);
+        time_t time_diff = samples[i].timestamp - samples[i+1].timestamp;
+        if (time_diff <= 0) {
+            continue;  /* Skip invalid samples with same/backwards timestamps */
+        }
+
+        double upload_rate = (double)(samples[i].bytes_out - samples[i+1].bytes_out) / (double)time_diff;
+        double download_rate = (double)(samples[i].bytes_in - samples[i+1].bytes_in) / (double)time_diff;
+
+        /* Absolute values for scaling (handle negative rates from counter resets) */
+        if (upload_rate < 0) upload_rate = -upload_rate;
+        if (download_rate < 0) download_rate = -download_rate;
+
         if (upload_rate > max_rate) max_rate = upload_rate;
         if (download_rate > max_rate) max_rate = download_rate;
     }
 
     if (max_rate < 1024.0) max_rate = 1024.0;  /* Minimum 1 KB/s scale */
 
-    /* Calculate graph area */
-    int graph_width = width - left_margin - right_margin;
-    int graph_height = height - top_margin - bottom_margin;
-    int graph_x = left_margin;
-    int graph_y = top_margin;
+    int graph_width = width - 2 * margin;
+    int graph_height = height - 2 * margin;
 
-    /* Draw Y-axis labels */
-    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
-    cairo_set_font_size(cr, 9);
+    /* Draw download line (green) with gradient fill */
+    cairo_set_line_width(cr, 2.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
 
-    for (int i = 0; i <= 4; i++) {
-        double rate_value = max_rate * (4 - i) / 4.0;
-        char label[32];
-        format_bytes((uint64_t)rate_value, label, sizeof(label));
-        strcat(label, "/s");
-
-        double y = graph_y + (graph_height / 4.0) * i;
-
-        /* Draw label */
-        cairo_text_extents_t extents;
-        cairo_text_extents(cr, label, &extents);
-        cairo_move_to(cr, left_margin - extents.width - 5, y + 3);
-        cairo_show_text(cr, label);
-    }
-
-    /* Draw grid lines (lighter color) */
-    cairo_set_source_rgba(cr, 0.9, 0.9, 0.9, 0.5);
-    cairo_set_line_width(cr, 1.0);
-    for (int i = 0; i <= 4; i++) {
-        double y = graph_y + (graph_height / 4.0) * i;
-        cairo_move_to(cr, graph_x, y);
-        cairo_line_to(cr, graph_x + graph_width, y);
-    }
-    cairo_stroke(cr);
-
-    /* Draw download area with gradient fill (green) */
-    cairo_pattern_t *download_gradient = cairo_pattern_create_linear(
-        0, graph_y, 0, graph_y + graph_height);
-    cairo_pattern_add_color_stop_rgba(download_gradient, 0.0, 0.2, 0.8, 0.4, 0.3);  /* Green with 30% opacity at top */
-    cairo_pattern_add_color_stop_rgba(download_gradient, 1.0, 0.2, 0.8, 0.4, 0.05); /* Green with 5% opacity at bottom */
-
-    cairo_move_to(cr, graph_x + graph_width, graph_y + graph_height);
-
-    /* Build points array for spline */
-    double points[sample_count][2];
+    gboolean first_point = TRUE;
     for (unsigned int i = 0; i < sample_count - 1; i++) {
         double rate = (samples[i].bytes_in - samples[i+1].bytes_in) /
                      (double)(samples[i].timestamp - samples[i+1].timestamp);
-        points[i][0] = graph_x + graph_width - (i * graph_width / 60.0);
-        points[i][1] = graph_y + graph_height - (rate / max_rate * graph_height);
+        double x = margin + graph_width - (i * graph_width / 60.0);
+        double y = margin + graph_height - (rate / max_rate * graph_height);
+
+        if (first_point) {
+            cairo_move_to(cr, x, y);
+            first_point = FALSE;
+        } else {
+            cairo_line_to(cr, x, y);
+        }
     }
 
-    /* Draw smooth spline through points */
-    for (unsigned int i = 0; i < sample_count - 2; i++) {
-        double x0 = (i == 0) ? points[i][0] : points[i-1][0];
-        double y0 = (i == 0) ? points[i][1] : points[i-1][1];
-        double x1 = points[i][0];
-        double y1 = points[i][1];
-        double x2 = points[i+1][0];
-        double y2 = points[i+1][1];
-        double x3 = (i == sample_count - 3) ? points[i+1][0] : points[i+2][0];
-        double y3 = (i == sample_count - 3) ? points[i+1][1] : points[i+2][1];
-
-        /* Catmull-Rom to Bezier conversion */
-        double cp1x = x1 + (x2 - x0) / 6.0;
-        double cp1y = y1 + (y2 - y0) / 6.0;
-        double cp2x = x2 - (x3 - x1) / 6.0;
-        double cp2y = y2 - (y3 - y1) / 6.0;
-
-        if (i == 0) cairo_move_to(cr, x1, y1);
-        cairo_curve_to(cr, cp1x, cp1y, cp2x, cp2y, x2, y2);
-    }
-
-    /* Close the path to baseline */
-    double last_x = graph_x + graph_width - ((sample_count - 2) * graph_width / 60.0);
-    cairo_line_to(cr, last_x, graph_y + graph_height);
+    /* Complete the path to create a filled area */
+    cairo_line_to(cr, margin, margin + graph_height);
+    cairo_line_to(cr, margin + graph_width, margin + graph_height);
     cairo_close_path(cr);
+
+    /* Create gradient fill from opaque to transparent */
+    cairo_pattern_t *download_gradient = cairo_pattern_create_linear(0, margin, 0, margin + graph_height);
+    cairo_pattern_add_color_stop_rgba(download_gradient, 0.0, 0.2, 0.8, 0.4, 0.3);
+    cairo_pattern_add_color_stop_rgba(download_gradient, 1.0, 0.2, 0.8, 0.4, 0.0);
     cairo_set_source(cr, download_gradient);
-    cairo_fill(cr);
+    cairo_fill_preserve(cr);
     cairo_pattern_destroy(download_gradient);
 
-    /* Draw download line on top (vibrant green) */
-    cairo_set_source_rgb(cr, 0.2, 0.8, 0.4);
-    cairo_set_line_width(cr, 2.5);
-    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-
-    for (unsigned int i = 0; i < sample_count - 2; i++) {
-        double x0 = (i == 0) ? points[i][0] : points[i-1][0];
-        double y0 = (i == 0) ? points[i][1] : points[i-1][1];
-        double x1 = points[i][0];
-        double y1 = points[i][1];
-        double x2 = points[i+1][0];
-        double y2 = points[i+1][1];
-        double x3 = (i == sample_count - 3) ? points[i+1][0] : points[i+2][0];
-        double y3 = (i == sample_count - 3) ? points[i+1][1] : points[i+2][1];
-
-        double cp1x = x1 + (x2 - x0) / 6.0;
-        double cp1y = y1 + (y2 - y0) / 6.0;
-        double cp2x = x2 - (x3 - x1) / 6.0;
-        double cp2y = y2 - (y3 - y1) / 6.0;
-
-        if (i == 0) cairo_move_to(cr, x1, y1);
-        cairo_curve_to(cr, cp1x, cp1y, cp2x, cp2y, x2, y2);
-    }
+    /* Stroke the line */
+    cairo_set_source_rgba(cr, 0.2, 0.8, 0.4, 0.8);
     cairo_stroke(cr);
 
-    /* Draw upload area with gradient fill (blue) */
-    cairo_pattern_t *upload_gradient = cairo_pattern_create_linear(
-        0, graph_y, 0, graph_y + graph_height);
-    cairo_pattern_add_color_stop_rgba(upload_gradient, 0.0, 0.2, 0.5, 0.95, 0.3);  /* Blue with 30% opacity at top */
-    cairo_pattern_add_color_stop_rgba(upload_gradient, 1.0, 0.2, 0.5, 0.95, 0.05); /* Blue with 5% opacity at bottom */
+    /* Draw upload line (blue) with gradient fill */
+    cairo_set_line_width(cr, 2.0);
 
-    cairo_move_to(cr, graph_x + graph_width, graph_y + graph_height);
-
-    /* Build points array for upload spline */
-    double upload_points[sample_count][2];
+    first_point = TRUE;
     for (unsigned int i = 0; i < sample_count - 1; i++) {
         double rate = (samples[i].bytes_out - samples[i+1].bytes_out) /
                      (double)(samples[i].timestamp - samples[i+1].timestamp);
-        upload_points[i][0] = graph_x + graph_width - (i * graph_width / 60.0);
-        upload_points[i][1] = graph_y + graph_height - (rate / max_rate * graph_height);
+        double x = margin + graph_width - (i * graph_width / 60.0);
+        double y = margin + graph_height - (rate / max_rate * graph_height);
+
+        if (first_point) {
+            cairo_move_to(cr, x, y);
+            first_point = FALSE;
+        } else {
+            cairo_line_to(cr, x, y);
+        }
     }
 
-    /* Draw smooth spline through points */
-    for (unsigned int i = 0; i < sample_count - 2; i++) {
-        double x0 = (i == 0) ? upload_points[i][0] : upload_points[i-1][0];
-        double y0 = (i == 0) ? upload_points[i][1] : upload_points[i-1][1];
-        double x1 = upload_points[i][0];
-        double y1 = upload_points[i][1];
-        double x2 = upload_points[i+1][0];
-        double y2 = upload_points[i+1][1];
-        double x3 = (i == sample_count - 3) ? upload_points[i+1][0] : upload_points[i+2][0];
-        double y3 = (i == sample_count - 3) ? upload_points[i+1][1] : upload_points[i+2][1];
-
-        double cp1x = x1 + (x2 - x0) / 6.0;
-        double cp1y = y1 + (y2 - y0) / 6.0;
-        double cp2x = x2 - (x3 - x1) / 6.0;
-        double cp2y = y2 - (y3 - y1) / 6.0;
-
-        if (i == 0) cairo_move_to(cr, x1, y1);
-        cairo_curve_to(cr, cp1x, cp1y, cp2x, cp2y, x2, y2);
-    }
-
-    /* Close the path to baseline */
-    last_x = graph_x + graph_width - ((sample_count - 2) * graph_width / 60.0);
-    cairo_line_to(cr, last_x, graph_y + graph_height);
+    /* Complete the path to create a filled area */
+    cairo_line_to(cr, margin, margin + graph_height);
+    cairo_line_to(cr, margin + graph_width, margin + graph_height);
     cairo_close_path(cr);
+
+    /* Create gradient fill from opaque to transparent */
+    cairo_pattern_t *upload_gradient = cairo_pattern_create_linear(0, margin, 0, margin + graph_height);
+    cairo_pattern_add_color_stop_rgba(upload_gradient, 0.0, 0.2, 0.5, 0.95, 0.3);
+    cairo_pattern_add_color_stop_rgba(upload_gradient, 1.0, 0.2, 0.5, 0.95, 0.0);
     cairo_set_source(cr, upload_gradient);
-    cairo_fill(cr);
+    cairo_fill_preserve(cr);
     cairo_pattern_destroy(upload_gradient);
 
-    /* Draw upload line on top (vibrant blue) */
-    cairo_set_source_rgb(cr, 0.2, 0.5, 0.95);
-    cairo_set_line_width(cr, 2.5);
-    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-
-    for (unsigned int i = 0; i < sample_count - 2; i++) {
-        double x0 = (i == 0) ? upload_points[i][0] : upload_points[i-1][0];
-        double y0 = (i == 0) ? upload_points[i][1] : upload_points[i-1][1];
-        double x1 = upload_points[i][0];
-        double y1 = upload_points[i][1];
-        double x2 = upload_points[i+1][0];
-        double y2 = upload_points[i+1][1];
-        double x3 = (i == sample_count - 3) ? upload_points[i+1][0] : upload_points[i+2][0];
-        double y3 = (i == sample_count - 3) ? upload_points[i+1][1] : upload_points[i+2][1];
-
-        double cp1x = x1 + (x2 - x0) / 6.0;
-        double cp1y = y1 + (y2 - y0) / 6.0;
-        double cp2x = x2 - (x3 - x1) / 6.0;
-        double cp2y = y2 - (y3 - y1) / 6.0;
-
-        if (i == 0) cairo_move_to(cr, x1, y1);
-        cairo_curve_to(cr, cp1x, cp1y, cp2x, cp2y, x2, y2);
-    }
+    /* Stroke the line */
+    cairo_set_source_rgba(cr, 0.2, 0.5, 0.95, 0.8);
     cairo_stroke(cr);
 
     return TRUE;
+}
+
+/**
+ * Toggle More Info revealer
+ */
+static void on_info_toggled(GtkButton *btn, gpointer data) {
+    GtkRevealer *revealer = GTK_REVEALER(data);
+    gboolean is_revealed = gtk_revealer_get_reveal_child(revealer);
+    gtk_revealer_set_reveal_child(revealer, !is_revealed);
+
+    /* Update button label */
+    gtk_button_set_label(btn, is_revealed ? "More Info ▼" : "More Info ▲");
+}
+
+/**
+ * Create a VPN statistics card
+ */
+static GtkWidget* create_vpn_stat_card(Dashboard *dashboard, VpnSession *session, BandwidthMonitor *monitor) {
+    (void)dashboard;  /* May be used for callbacks later */
+
+    /* Main card container */
+    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(card, 400, -1);
+    GtkStyleContext *card_context = gtk_widget_get_style_context(card);
+    gtk_style_context_add_class(card_context, "vpn-stat-card");
+
+    /* Header row: [●] DEV-SERVER (UDP)                      [More Info] */
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(header), 0);
+
+    /* Status indicator */
+    const char *status_icon = "●";
+    GtkWidget *status_label = gtk_label_new(status_icon);
+    if (session->state == SESSION_STATE_CONNECTED) {
+        gtk_label_set_markup(GTK_LABEL(status_label), "<span foreground='#34C759'>●</span>");
+    } else if (session->state == SESSION_STATE_CONNECTING) {
+        gtk_label_set_markup(GTK_LABEL(status_label), "<span foreground='#FF9500'>●</span>");
+    } else {
+        gtk_label_set_markup(GTK_LABEL(status_label), "<span foreground='#FF3B30'>●</span>");
+    }
+    gtk_box_pack_start(GTK_BOX(header), status_label, FALSE, FALSE, 0);
+
+    /* Session name and protocol */
+    char header_text[256];
+    snprintf(header_text, sizeof(header_text), "<span weight='bold' size='14000'>%s</span> <span size='11000' foreground='#888888'>(UDP)</span>",
+             session->config_name ? session->config_name : "Unknown");
+    GtkWidget *name_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(name_label), header_text);
+    gtk_label_set_xalign(GTK_LABEL(name_label), 0.0);
+    gtk_box_pack_start(GTK_BOX(header), name_label, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(card), header, FALSE, FALSE, 0);
+
+    /* Separator */
+    gtk_box_pack_start(GTK_BOX(card), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 5);
+
+    /* Real-time throughput row */
+    GtkWidget *throughput_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+    gtk_widget_set_halign(throughput_box, GTK_ALIGN_CENTER);
+    gtk_container_set_border_width(GTK_CONTAINER(throughput_box), 5);
+
+    /* Download speed */
+    GtkWidget *download_label = gtk_label_new("↓ 0 B/s");
+    gtk_style_context_add_class(gtk_widget_get_style_context(download_label), "card-bandwidth");
+    gtk_box_pack_start(GTK_BOX(throughput_box), download_label, FALSE, FALSE, 0);
+
+    /* Upload speed */
+    GtkWidget *upload_label = gtk_label_new("↑ 0 B/s");
+    gtk_style_context_add_class(gtk_widget_get_style_context(upload_label), "card-bandwidth");
+    gtk_box_pack_start(GTK_BOX(throughput_box), upload_label, FALSE, FALSE, 0);
+
+    /* Store labels as widget data for updates */
+    g_object_set_data(G_OBJECT(card), "download-label", download_label);
+    g_object_set_data(G_OBJECT(card), "upload-label", upload_label);
+
+    gtk_box_pack_start(GTK_BOX(card), throughput_box, FALSE, FALSE, 0);
+
+    /* Sparkline graph */
+    GtkWidget *graph = gtk_drawing_area_new();
+    gtk_widget_set_size_request(graph, -1, 80);
+    gtk_style_context_add_class(gtk_widget_get_style_context(graph), "card-graph-area");
+    g_signal_connect(graph, "draw", G_CALLBACK(on_card_graph_draw), monitor);
+    g_object_set_data(G_OBJECT(card), "graph-area", graph);
+    gtk_box_pack_start(GTK_BOX(card), graph, FALSE, FALSE, 5);
+
+    /* Separator */
+    gtk_box_pack_start(GTK_BOX(card), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 5);
+
+    /* Detail grid: 2 columns */
+    GtkWidget *detail_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(detail_grid), 40);
+    gtk_grid_set_row_spacing(GTK_GRID(detail_grid), 4);
+    gtk_container_set_border_width(GTK_CONTAINER(detail_grid), 10);
+
+    /* Left column header */
+    GtkWidget *packets_header = gtk_label_new("PACKETS");
+    gtk_style_context_add_class(gtk_widget_get_style_context(packets_header), "card-stats-label");
+    gtk_label_set_xalign(GTK_LABEL(packets_header), 0.0);
+    gtk_grid_attach(GTK_GRID(detail_grid), packets_header, 0, 0, 1, 1);
+
+    /* Right column header */
+    GtkWidget *connection_header = gtk_label_new("CONNECTION");
+    gtk_style_context_add_class(gtk_widget_get_style_context(connection_header), "card-stats-label");
+    gtk_label_set_xalign(GTK_LABEL(connection_header), 0.0);
+    gtk_grid_attach(GTK_GRID(detail_grid), connection_header, 1, 0, 1, 1);
+
+    /* Packet stats - left column */
+    GtkWidget *sent_label = gtk_label_new("Sent:     0");
+    gtk_label_set_xalign(GTK_LABEL(sent_label), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(sent_label), "card-stats-label");
+    gtk_grid_attach(GTK_GRID(detail_grid), sent_label, 0, 1, 1, 1);
+    g_object_set_data(G_OBJECT(card), "sent-label", sent_label);
+
+    GtkWidget *received_label = gtk_label_new("Received: 0");
+    gtk_label_set_xalign(GTK_LABEL(received_label), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(received_label), "card-stats-label");
+    gtk_grid_attach(GTK_GRID(detail_grid), received_label, 0, 2, 1, 1);
+    g_object_set_data(G_OBJECT(card), "received-label", received_label);
+
+    GtkWidget *errors_label = gtk_label_new("Errors:   0");
+    gtk_label_set_xalign(GTK_LABEL(errors_label), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(errors_label), "card-stats-label");
+    gtk_grid_attach(GTK_GRID(detail_grid), errors_label, 0, 3, 1, 1);
+    g_object_set_data(G_OBJECT(card), "errors-label", errors_label);
+
+    /* Connection details - right column */
+    char local_ip[64];
+    if (session->device_name && get_interface_ip(session->device_name, local_ip, sizeof(local_ip)) == 0) {
+        char local_text[128];
+        snprintf(local_text, sizeof(local_text), "Local:  %s", local_ip);
+        GtkWidget *local_label = gtk_label_new(local_text);
+        gtk_label_set_xalign(GTK_LABEL(local_label), 0.0);
+        gtk_style_context_add_class(gtk_widget_get_style_context(local_label), "card-stats-label");
+        gtk_grid_attach(GTK_GRID(detail_grid), local_label, 1, 1, 1, 1);
+    }
+
+    char gateway[64];
+    if (session->device_name && get_interface_gateway(session->device_name, gateway, sizeof(gateway)) == 0) {
+        char gw_text[128];
+        snprintf(gw_text, sizeof(gw_text), "Gateway: %s", gateway);
+        GtkWidget *gw_label = gtk_label_new(gw_text);
+        gtk_label_set_xalign(GTK_LABEL(gw_label), 0.0);
+        gtk_style_context_add_class(gtk_widget_get_style_context(gw_label), "card-stats-label");
+        gtk_grid_attach(GTK_GRID(detail_grid), gw_label, 1, 2, 1, 1);
+    }
+
+    GtkWidget *cipher_label = gtk_label_new("Cipher:  AES-256-GCM");  /* TODO: Get from D-Bus */
+    gtk_label_set_xalign(GTK_LABEL(cipher_label), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(cipher_label), "card-stats-label");
+    gtk_grid_attach(GTK_GRID(detail_grid), cipher_label, 1, 3, 1, 1);
+
+    gtk_box_pack_start(GTK_BOX(card), detail_grid, FALSE, FALSE, 0);
+
+    /* More Info Revealer Section */
+    GtkWidget *revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(revealer), 250);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(revealer), FALSE);
+
+    /* More Info diagnostic grid */
+    GtkWidget *more_info_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(more_info_grid), 30);
+    gtk_grid_set_row_spacing(GTK_GRID(more_info_grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(more_info_grid), 15);
+    gtk_style_context_add_class(gtk_widget_get_style_context(more_info_grid), "more-info-grid");
+
+    int row = 0;
+
+    /* Network Path Section */
+    GtkWidget *net_header = gtk_label_new("NETWORK PATH");
+    gtk_style_context_add_class(gtk_widget_get_style_context(net_header), "info-label");
+    gtk_label_set_xalign(GTK_LABEL(net_header), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), net_header, 0, row++, 2, 1);
+
+    GtkWidget *mtu_label = gtk_label_new("MTU Size:");
+    gtk_label_set_xalign(GTK_LABEL(mtu_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), mtu_label, 0, row, 1, 1);
+    GtkWidget *mtu_value = gtk_label_new("1500 bytes");  /* TODO: Get from system */
+    gtk_label_set_xalign(GTK_LABEL(mtu_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(mtu_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), mtu_value, 1, row++, 1, 1);
+
+    GtkWidget *endpoint_label = gtk_label_new("Remote Endpoint:");
+    gtk_label_set_xalign(GTK_LABEL(endpoint_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), endpoint_label, 0, row, 1, 1);
+    GtkWidget *endpoint_value = gtk_label_new("0.0.0.0:1194");  /* TODO: Get from session */
+    gtk_label_set_xalign(GTK_LABEL(endpoint_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(endpoint_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), endpoint_value, 1, row++, 1, 1);
+
+    GtkWidget *keepalive_label = gtk_label_new("Keepalive:");
+    gtk_label_set_xalign(GTK_LABEL(keepalive_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), keepalive_label, 0, row, 1, 1);
+    GtkWidget *keepalive_value = gtk_label_new("10s / 60s");  /* TODO: Get from config */
+    gtk_label_set_xalign(GTK_LABEL(keepalive_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(keepalive_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), keepalive_value, 1, row++, 1, 1);
+
+    row++;  /* Spacer */
+
+    /* Security Section */
+    GtkWidget *sec_header = gtk_label_new("SECURITY");
+    gtk_style_context_add_class(gtk_widget_get_style_context(sec_header), "info-label");
+    gtk_label_set_xalign(GTK_LABEL(sec_header), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), sec_header, 0, row++, 2, 1);
+
+    GtkWidget *tls_label = gtk_label_new("TLS Version:");
+    gtk_label_set_xalign(GTK_LABEL(tls_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), tls_label, 0, row, 1, 1);
+    GtkWidget *tls_value = gtk_label_new("TLSv1.3");  /* TODO: Get from session */
+    gtk_label_set_xalign(GTK_LABEL(tls_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(tls_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), tls_value, 1, row++, 1, 1);
+
+    GtkWidget *ctrl_cipher_label = gtk_label_new("Control Cipher:");
+    gtk_label_set_xalign(GTK_LABEL(ctrl_cipher_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), ctrl_cipher_label, 0, row, 1, 1);
+    GtkWidget *ctrl_cipher_value = gtk_label_new("TLS-DHE-RSA-WITH-AES-256-GCM-SHA384");
+    gtk_label_set_xalign(GTK_LABEL(ctrl_cipher_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ctrl_cipher_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), ctrl_cipher_value, 1, row++, 1, 1);
+
+    GtkWidget *cert_label = gtk_label_new("Certificate Expiry:");
+    gtk_label_set_xalign(GTK_LABEL(cert_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), cert_label, 0, row, 1, 1);
+    GtkWidget *cert_value = gtk_label_new("2025-12-31 (Valid)");  /* TODO: Get from session */
+    gtk_label_set_xalign(GTK_LABEL(cert_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(cert_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), cert_value, 1, row++, 1, 1);
+
+    row++;  /* Spacer */
+
+    /* Quality Section */
+    GtkWidget *qual_header = gtk_label_new("QUALITY");
+    gtk_style_context_add_class(gtk_widget_get_style_context(qual_header), "info-label");
+    gtk_label_set_xalign(GTK_LABEL(qual_header), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), qual_header, 0, row++, 2, 1);
+
+    GtkWidget *latency_label = gtk_label_new("Current Latency:");
+    gtk_label_set_xalign(GTK_LABEL(latency_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), latency_label, 0, row, 1, 1);
+    GtkWidget *latency_value = gtk_label_new("12 ms");  /* TODO: Calculate */
+    gtk_label_set_xalign(GTK_LABEL(latency_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(latency_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), latency_value, 1, row++, 1, 1);
+
+    GtkWidget *jitter_label = gtk_label_new("Jitter:");
+    gtk_label_set_xalign(GTK_LABEL(jitter_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), jitter_label, 0, row, 1, 1);
+    GtkWidget *jitter_value = gtk_label_new("2 ms");  /* TODO: Calculate */
+    gtk_label_set_xalign(GTK_LABEL(jitter_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(jitter_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), jitter_value, 1, row++, 1, 1);
+
+    GtkWidget *loss_label = gtk_label_new("Packet Loss:");
+    gtk_label_set_xalign(GTK_LABEL(loss_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), loss_label, 0, row, 1, 1);
+    GtkWidget *loss_value = gtk_label_new("0.00%");  /* TODO: Calculate from stats */
+    gtk_label_set_xalign(GTK_LABEL(loss_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(loss_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), loss_value, 1, row++, 1, 1);
+
+    row++;  /* Spacer */
+
+    /* Internal Section */
+    GtkWidget *int_header = gtk_label_new("INTERNAL");
+    gtk_style_context_add_class(gtk_widget_get_style_context(int_header), "info-label");
+    gtk_label_set_xalign(GTK_LABEL(int_header), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), int_header, 0, row++, 2, 1);
+
+    GtkWidget *dns_label = gtk_label_new("Virtual DNS:");
+    gtk_label_set_xalign(GTK_LABEL(dns_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), dns_label, 0, row, 1, 1);
+    char dns_text[128];
+    if (session->device_name && get_interface_gateway(session->device_name, gateway, sizeof(gateway)) == 0) {
+        snprintf(dns_text, sizeof(dns_text), "%s", gateway);
+    } else {
+        snprintf(dns_text, sizeof(dns_text), "N/A");
+    }
+    GtkWidget *dns_value = gtk_label_new(dns_text);
+    gtk_label_set_xalign(GTK_LABEL(dns_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(dns_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), dns_value, 1, row++, 1, 1);
+
+    GtkWidget *routing_label = gtk_label_new("Routing Flags:");
+    gtk_label_set_xalign(GTK_LABEL(routing_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), routing_label, 0, row, 1, 1);
+    GtkWidget *routing_value = gtk_label_new("UG (Gateway)");  /* TODO: Parse from route */
+    gtk_label_set_xalign(GTK_LABEL(routing_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(routing_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), routing_value, 1, row++, 1, 1);
+
+    GtkWidget *peer_label = gtk_label_new("Peer ID:");
+    gtk_label_set_xalign(GTK_LABEL(peer_label), 0.0);
+    gtk_grid_attach(GTK_GRID(more_info_grid), peer_label, 0, row, 1, 1);
+    GtkWidget *peer_value = gtk_label_new("0");  /* TODO: Get from session */
+    gtk_label_set_xalign(GTK_LABEL(peer_value), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(peer_value), "info-value");
+    gtk_grid_attach(GTK_GRID(more_info_grid), peer_value, 1, row++, 1, 1);
+
+    gtk_container_add(GTK_CONTAINER(revealer), more_info_grid);
+    gtk_box_pack_start(GTK_BOX(card), revealer, FALSE, FALSE, 0);
+
+    /* More Info button with revealer toggle */
+    GtkWidget *info_btn = gtk_button_new_with_label("More Info ▼");
+    g_signal_connect(info_btn, "clicked", G_CALLBACK(on_info_toggled), revealer);
+    gtk_box_pack_start(GTK_BOX(header), info_btn, FALSE, FALSE, 0);
+
+    return card;
 }
 
 /**
@@ -502,138 +674,6 @@ static void on_connect_clicked(GtkButton *button, gpointer data) {
         g_free(session_path);
         /* Update dashboard after connect */
         dashboard_update(dashboard, dashboard->bus);
-    }
-}
-
-/**
- * Export statistics button callback
- */
-static void on_export_stats_clicked(GtkButton *button, gpointer data) {
-    Dashboard *dashboard = (Dashboard *)data;
-
-    if (!dashboard || !dashboard->bandwidth_monitor) {
-        return;
-    }
-
-    /* Create filename with timestamp */
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char filename[256];
-    strftime(filename, sizeof(filename), "vpn-stats-%Y%m%d-%H%M%S.csv", tm_info);
-
-    /* Open file for writing */
-    FILE *fp = fopen(filename, "w");
-    if (!fp) {
-        fprintf(stderr, "Failed to create statistics file: %s\n", filename);
-        return;
-    }
-
-    /* Write CSV header */
-    fprintf(fp, "Timestamp,Bytes In,Bytes Out,Packets In,Packets Out,Errors In,Errors Out,Dropped In,Dropped Out\n");
-
-    /* Get all samples */
-    BandwidthSample samples[60];
-    unsigned int sample_count = 0;
-    if (bandwidth_monitor_get_samples(dashboard->bandwidth_monitor, samples, 60, &sample_count) >= 0) {
-        /* Write samples in chronological order (oldest first) */
-        for (int i = sample_count - 1; i >= 0; i--) {
-            char timestamp[32];
-            struct tm *sample_tm = localtime(&samples[i].timestamp);
-            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", sample_tm);
-
-            fprintf(fp, "%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
-                   timestamp,
-                   samples[i].bytes_in,
-                   samples[i].bytes_out,
-                   samples[i].packets_in,
-                   samples[i].packets_out,
-                   samples[i].errors_in,
-                   samples[i].errors_out,
-                   samples[i].dropped_in,
-                   samples[i].dropped_out);
-        }
-    }
-
-    fclose(fp);
-    printf("Statistics exported to: %s\n", filename);
-}
-
-/**
- * Reset statistics button callback
- */
-static void on_reset_stats_clicked(GtkButton *button, gpointer data) {
-    Dashboard *dashboard = (Dashboard *)data;
-
-    if (!dashboard || !dashboard->bandwidth_monitor) {
-        return;
-    }
-
-    /* Reset the bandwidth monitor */
-    bandwidth_monitor_reset(dashboard->bandwidth_monitor);
-    printf("Statistics counters reset\n");
-
-    /* Update dashboard to reflect reset values */
-    if (dashboard->bus) {
-        dashboard_update(dashboard, dashboard->bus);
-    }
-}
-
-/**
- * Session combo box changed callback
- */
-static void on_session_combo_changed(GtkComboBox *combo, gpointer data) {
-    Dashboard *dashboard = (Dashboard *)data;
-
-    if (!dashboard || !dashboard->bus) {
-        return;
-    }
-
-    gint active_index = gtk_combo_box_get_active(combo);
-    if (active_index < 0) {
-        return;
-    }
-
-    /* Build keys for data lookup */
-    char key_path[32];
-    char key_device[32];
-    snprintf(key_path, sizeof(key_path), "session-path-%d", active_index);
-    snprintf(key_device, sizeof(key_device), "device-name-%d", active_index);
-
-    /* Get the session path stored with this combo box item */
-    char *session_path = g_object_get_data(G_OBJECT(combo), key_path);
-    char *device_name = g_object_get_data(G_OBJECT(combo), key_device);
-
-    if (!session_path || !device_name) {
-        printf("No session data for index %d\n", active_index);
-        return;
-    }
-
-    printf("Dashboard: Switching to monitor session %s (device: %s)\n", session_path, device_name);
-
-    /* Recreate bandwidth monitor for the selected session */
-    if (dashboard->bandwidth_monitor) {
-        bandwidth_monitor_free(dashboard->bandwidth_monitor);
-        dashboard->bandwidth_monitor = NULL;
-    }
-
-    free(dashboard->current_device);
-    dashboard->current_device = NULL;
-
-    /* Create new monitor */
-    dashboard->bandwidth_monitor = bandwidth_monitor_create(
-        session_path,
-        device_name,
-        STATS_SOURCE_AUTO,  /* Try D-Bus first, fallback to sysfs */
-        60  /* 60-second buffer */
-    );
-    dashboard->current_device = strdup(device_name);
-
-    if (dashboard->bandwidth_monitor) {
-        printf("Dashboard: Switched to monitoring session: %s\n", session_path);
-        /* Trigger immediate update */
-        dashboard_update(dashboard, dashboard->bus);
-    } else {
-        printf("Dashboard: Failed to create bandwidth monitor for session: %s\n", session_path);
     }
 }
 
@@ -955,258 +995,50 @@ Dashboard* dashboard_create(void) {
     gtk_notebook_append_page(GTK_NOTEBOOK(dashboard->notebook), connections_scrolled,
                             gtk_label_new("Connections"));
 
-    /* Tab 2: Statistics */
-    dashboard->statistics_tab = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_container_set_border_width(GTK_CONTAINER(dashboard->statistics_tab), 20);
+    /* Tab 2: Statistics - Card-based view */
+    GtkWidget *stats_scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(stats_scrolled),
+                                   GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
 
-    /* Header row: Session selector + Duration */
-    GtkWidget *stats_header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+    /* Main container for statistics tab */
+    dashboard->statistics_tab = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    /* Session selector combo box */
-    GtkWidget *session_selector_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *session_label = gtk_label_new("Session:");
-    gtk_box_pack_start(GTK_BOX(session_selector_box), session_label, FALSE, FALSE, 0);
+    /* FlowBox for stat cards - wraps automatically */
+    dashboard->stats_flowbox = gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(dashboard->stats_flowbox), GTK_SELECTION_NONE);
+    gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(dashboard->stats_flowbox), FALSE);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(dashboard->stats_flowbox), 4);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(dashboard->stats_flowbox), 10);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(dashboard->stats_flowbox), 10);
+    gtk_widget_set_margin_start(dashboard->stats_flowbox, 20);
+    gtk_widget_set_margin_end(dashboard->stats_flowbox, 20);
+    gtk_widget_set_margin_top(dashboard->stats_flowbox, 20);
+    gtk_widget_set_margin_bottom(dashboard->stats_flowbox, 20);
 
-    dashboard->stats_session_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(dashboard->stats_session_combo), "No active sessions");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(dashboard->stats_session_combo), 0);
-    g_signal_connect(dashboard->stats_session_combo, "changed",
-                    G_CALLBACK(on_session_combo_changed), dashboard);
-    gtk_box_pack_start(GTK_BOX(session_selector_box), dashboard->stats_session_combo, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(stats_scrolled), dashboard->stats_flowbox);
+    gtk_box_pack_start(GTK_BOX(dashboard->statistics_tab), stats_scrolled, TRUE, TRUE, 0);
 
-    gtk_box_pack_start(GTK_BOX(stats_header_box), session_selector_box, FALSE, FALSE, 0);
-
-    /* Duration label */
-    dashboard->stats_duration_label = gtk_label_new("Duration: --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_duration_label), 1.0);
-    gtk_box_pack_start(GTK_BOX(stats_header_box), dashboard->stats_duration_label, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(dashboard->statistics_tab), stats_header_box, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->statistics_tab), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
-
-    /* Create content container (shown when connected) */
-    dashboard->stats_content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_box_pack_start(GTK_BOX(dashboard->statistics_tab), dashboard->stats_content_box, TRUE, TRUE, 0);
-
-    /* Create empty state (shown when disconnected) */
+    /* Empty state (shown when no VPNs connected) */
     dashboard->stats_empty_state = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
     gtk_widget_set_valign(dashboard->stats_empty_state, GTK_ALIGN_CENTER);
     gtk_widget_set_halign(dashboard->stats_empty_state, GTK_ALIGN_CENTER);
     gtk_widget_set_vexpand(dashboard->stats_empty_state, TRUE);
 
-    /* Empty state icon */
     GtkWidget *empty_icon = gtk_image_new_from_icon_name("network-offline-symbolic", GTK_ICON_SIZE_DIALOG);
     gtk_image_set_pixel_size(GTK_IMAGE(empty_icon), 96);
     gtk_widget_set_opacity(empty_icon, 0.3);
     gtk_box_pack_start(GTK_BOX(dashboard->stats_empty_state), empty_icon, FALSE, FALSE, 0);
 
-    /* Empty state message */
     GtkWidget *empty_label = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(empty_label),
-                        "<span size='large' weight='600'>No active connection</span>\n"
+                        "<span size='large' weight='600'>No active connections</span>\n"
                         "<span foreground='#888888'>Connect to a VPN to see statistics</span>");
     gtk_label_set_justify(GTK_LABEL(empty_label), GTK_JUSTIFY_CENTER);
     gtk_box_pack_start(GTK_BOX(dashboard->stats_empty_state), empty_label, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(dashboard->statistics_tab), dashboard->stats_empty_state, TRUE, TRUE, 0);
-
-    /* Initially hide empty state (will be shown/hidden in dashboard_update) */
     gtk_widget_set_no_show_all(dashboard->stats_empty_state, TRUE);
-
-    /* Bandwidth section */
-    GtkWidget *bandwidth_header = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(bandwidth_header),
-                        "<span size='large' weight='600'>Bandwidth (Live - 2s refresh)</span>");
-    gtk_label_set_xalign(GTK_LABEL(bandwidth_header), 0.0);
-    gtk_widget_set_margin_top(bandwidth_header, 8);
-    gtk_widget_set_margin_bottom(bandwidth_header, 8);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), bandwidth_header, FALSE, FALSE, 0);
-
-    /* Bandwidth frame - no visible border for clean look */
-    GtkWidget *bandwidth_frame = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(bandwidth_frame), GTK_SHADOW_NONE);
-    GtkWidget *bandwidth_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_container_set_border_width(GTK_CONTAINER(bandwidth_box), 12);
-
-    /* Upload rate */
-    dashboard->stats_upload_label = gtk_label_new("  ▲ Upload:   0 B/s");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_upload_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(bandwidth_box), dashboard->stats_upload_label, FALSE, FALSE, 0);
-
-    /* Download rate */
-    dashboard->stats_download_label = gtk_label_new("  ▼ Download: 0 B/s");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_download_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(bandwidth_box), dashboard->stats_download_label, FALSE, FALSE, 0);
-
-    /* Bandwidth graph */
-    dashboard->stats_graph_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(dashboard->stats_graph_area, -1, 120);
-    gtk_widget_set_margin_top(dashboard->stats_graph_area, 8);
-    g_signal_connect(dashboard->stats_graph_area, "draw",
-                    G_CALLBACK(on_stats_graph_draw), dashboard);
-    gtk_box_pack_start(GTK_BOX(bandwidth_box), dashboard->stats_graph_area, FALSE, FALSE, 0);
-
-    gtk_container_add(GTK_CONTAINER(bandwidth_frame), bandwidth_box);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), bandwidth_frame, FALSE, FALSE, 0);
-
-    /* Separator */
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 8);
-
-    /* 4-column grid for Total Transfer + Packet Statistics */
-    GtkWidget *stats_grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(stats_grid), 12);
-    gtk_grid_set_row_spacing(GTK_GRID(stats_grid), 8);
-    gtk_grid_set_column_homogeneous(GTK_GRID(stats_grid), TRUE);  /* Equal width columns (25% each) */
-    gtk_widget_set_hexpand(stats_grid, TRUE);  /* Expand to fill 100% width */
-    gtk_widget_set_margin_top(stats_grid, 8);
-
-    /* Row 0: Section headers */
-    GtkWidget *total_header = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(total_header),
-                        "<span size='large' weight='600'>Total Transfer</span>");
-    gtk_label_set_xalign(GTK_LABEL(total_header), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), total_header, 0, 0, 2, 1);  /* Span 2 columns */
-
-    GtkWidget *packets_header = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(packets_header),
-                        "<span size='large' weight='600'>Packet Statistics</span>");
-    gtk_label_set_xalign(GTK_LABEL(packets_header), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), packets_header, 2, 0, 2, 1);  /* Span 2 columns */
-
-    /* Row 1: Uploaded / Sent */
-    GtkWidget *uploaded_label = gtk_label_new("Uploaded:");
-    gtk_label_set_xalign(GTK_LABEL(uploaded_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), uploaded_label, 0, 1, 1, 1);
-
-    dashboard->stats_total_uploaded_label = gtk_label_new("0 B");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_total_uploaded_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_total_uploaded_label, 1, 1, 1, 1);
-
-    GtkWidget *sent_label = gtk_label_new("Sent:");
-    gtk_label_set_xalign(GTK_LABEL(sent_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), sent_label, 2, 1, 1, 1);
-
-    dashboard->stats_packets_sent_label = gtk_label_new("0 packets");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_packets_sent_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_packets_sent_label, 3, 1, 1, 1);
-
-    /* Row 2: Downloaded / Received */
-    GtkWidget *downloaded_label = gtk_label_new("Downloaded:");
-    gtk_label_set_xalign(GTK_LABEL(downloaded_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), downloaded_label, 0, 2, 1, 1);
-
-    dashboard->stats_total_downloaded_label = gtk_label_new("0 B");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_total_downloaded_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_total_downloaded_label, 1, 2, 1, 1);
-
-    GtkWidget *received_label = gtk_label_new("Received:");
-    gtk_label_set_xalign(GTK_LABEL(received_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), received_label, 2, 2, 1, 1);
-
-    dashboard->stats_packets_received_label = gtk_label_new("0 packets");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_packets_received_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_packets_received_label, 3, 2, 1, 1);
-
-    /* Row 3: Total / Errors */
-    GtkWidget *total_label = gtk_label_new("Total:");
-    gtk_label_set_xalign(GTK_LABEL(total_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), total_label, 0, 3, 1, 1);
-
-    dashboard->stats_total_combined_label = gtk_label_new("0 B");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_total_combined_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_total_combined_label, 1, 3, 1, 1);
-
-    GtkWidget *errors_label = gtk_label_new("Errors:");
-    gtk_label_set_xalign(GTK_LABEL(errors_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), errors_label, 2, 3, 1, 1);
-
-    dashboard->stats_packets_errors_label = gtk_label_new("0");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_packets_errors_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_packets_errors_label, 3, 3, 1, 1);
-
-    /* Row 4: Empty / Dropped */
-    GtkWidget *dropped_label = gtk_label_new("Dropped:");
-    gtk_label_set_xalign(GTK_LABEL(dropped_label), 0.0);
-    gtk_grid_attach(GTK_GRID(stats_grid), dropped_label, 2, 4, 1, 1);
-
-    dashboard->stats_packets_dropped_label = gtk_label_new("0");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_packets_dropped_label), 1.0);  /* Right-align */
-    gtk_grid_attach(GTK_GRID(stats_grid), dashboard->stats_packets_dropped_label, 3, 4, 1, 1);
-
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), stats_grid, FALSE, FALSE, 0);
-
-    /* Separator */
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 8);
-
-    /* Connection Details section */
-    GtkWidget *details_header = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(details_header),
-                        "<span size='large' weight='600'>Connection Details</span>");
-    gtk_label_set_xalign(GTK_LABEL(details_header), 0.0);
-    gtk_widget_set_margin_bottom(details_header, 8);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), details_header, FALSE, FALSE, 0);
-
-    /* Protocol - with icon */
-    GtkWidget *protocol_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *protocol_icon = gtk_image_new_from_icon_name("network-wired-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(protocol_box), protocol_icon, FALSE, FALSE, 0);
-    dashboard->stats_protocol_label = gtk_label_new("Protocol: --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_protocol_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(protocol_box), dashboard->stats_protocol_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), protocol_box, FALSE, FALSE, 0);
-
-    /* Cipher - with icon */
-    GtkWidget *cipher_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *cipher_icon = gtk_image_new_from_icon_name("channel-secure-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(cipher_box), cipher_icon, FALSE, FALSE, 0);
-    dashboard->stats_cipher_label = gtk_label_new("Cipher:   --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_cipher_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(cipher_box), dashboard->stats_cipher_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), cipher_box, FALSE, FALSE, 0);
-
-    /* Server - with icon */
-    GtkWidget *server_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *server_icon = gtk_image_new_from_icon_name("network-server-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(server_box), server_icon, FALSE, FALSE, 0);
-    dashboard->stats_server_label = gtk_label_new("Server:   --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_server_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(server_box), dashboard->stats_server_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), server_box, FALSE, FALSE, 0);
-
-    /* Local IP - with icon */
-    GtkWidget *localip_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *localip_icon = gtk_image_new_from_icon_name("network-workgroup-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(localip_box), localip_icon, FALSE, FALSE, 0);
-    dashboard->stats_local_ip_label = gtk_label_new("Local IP: --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_local_ip_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(localip_box), dashboard->stats_local_ip_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), localip_box, FALSE, FALSE, 0);
-
-    /* Gateway - with icon */
-    GtkWidget *gateway_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *gateway_icon = gtk_image_new_from_icon_name("network-transmit-symbolic", GTK_ICON_SIZE_MENU);
-    gtk_box_pack_start(GTK_BOX(gateway_box), gateway_icon, FALSE, FALSE, 0);
-    dashboard->stats_gateway_label = gtk_label_new("Gateway:  --");
-    gtk_label_set_xalign(GTK_LABEL(dashboard->stats_gateway_label), 0.0);
-    gtk_box_pack_start(GTK_BOX(gateway_box), dashboard->stats_gateway_label, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), gateway_box, FALSE, FALSE, 0);
-
-    /* Separator */
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 8);
-
-    /* Buttons row */
-    GtkWidget *stats_buttons_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_set_margin_top(stats_buttons_box, 8);
-
-    GtkWidget *export_btn = gtk_button_new_with_label("Export Statistics");
-    g_signal_connect(export_btn, "clicked", G_CALLBACK(on_export_stats_clicked), dashboard);
-    gtk_box_pack_start(GTK_BOX(stats_buttons_box), export_btn, FALSE, FALSE, 0);
-
-    GtkWidget *reset_btn = gtk_button_new_with_label("Reset Counters");
-    g_signal_connect(reset_btn, "clicked", G_CALLBACK(on_reset_stats_clicked), dashboard);
-    gtk_box_pack_start(GTK_BOX(stats_buttons_box), reset_btn, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(dashboard->stats_content_box), stats_buttons_box, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(dashboard->notebook), dashboard->statistics_tab,
                             gtk_label_new("Statistics"));
@@ -1232,6 +1064,14 @@ Dashboard* dashboard_create(void) {
     gtk_box_pack_start(GTK_BOX(dashboard->security_tab), security_label, TRUE, TRUE, 0);
     gtk_notebook_append_page(GTK_NOTEBOOK(dashboard->notebook), dashboard->security_tab,
                             gtk_label_new("Security"));
+
+    /* Initialize bandwidth monitors hash table */
+    dashboard->bandwidth_monitors = g_hash_table_new_full(
+        g_str_hash,
+        g_str_equal,
+        g_free,
+        (GDestroyNotify)bandwidth_monitor_free
+    );
 
     /* Add notebook to window */
     gtk_container_add(GTK_CONTAINER(dashboard->window), dashboard->notebook);
@@ -1358,228 +1198,120 @@ void dashboard_update(Dashboard *dashboard, sd_bus *bus) {
     /* Add Import Config row at the end of the list */
     create_import_config_row(dashboard);
 
-    /* Update bandwidth statistics */
+    /* Update Statistics Tab - Card-based view for multiple sessions */
+    /* Clear existing stat cards */
+    gtk_container_foreach(GTK_CONTAINER(dashboard->stats_flowbox),
+                         (GtkCallback)gtk_widget_destroy, NULL);
+
     if (session_count > 0 && sessions) {
-        /* Show statistics content, hide empty state */
-        gtk_widget_show(dashboard->stats_content_box);
+        /* Hide empty state */
         gtk_widget_hide(dashboard->stats_empty_state);
 
-        /* Clear and repopulate session combo box */
-        gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(dashboard->stats_session_combo));
-
-        /* Store current selection to restore it if possible */
-        gint previous_index = gtk_combo_box_get_active(GTK_COMBO_BOX(dashboard->stats_session_combo));
-
-        /* Add all active sessions to combo box */
+        /* Create/update stat cards for each session */
         for (unsigned int i = 0; i < session_count; i++) {
             VpnSession *session = sessions[i];
-            char item_text[256];
-            snprintf(item_text, sizeof(item_text), "%s",
-                    session->config_name ? session->config_name : "Unknown");
-            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(dashboard->stats_session_combo), item_text);
 
-            /* Store session path and device name with this index */
-            char key_path[32];
-            char key_device[32];
-            snprintf(key_path, sizeof(key_path), "session-path-%u", i);
-            snprintf(key_device, sizeof(key_device), "device-name-%u", i);
-
-            g_object_set_data_full(G_OBJECT(dashboard->stats_session_combo), key_path,
-                                  g_strdup(session->session_path), g_free);
-            g_object_set_data_full(G_OBJECT(dashboard->stats_session_combo), key_device,
-                                  g_strdup(session->device_name ? session->device_name : ""), g_free);
-        }
-
-        /* Restore previous selection or default to first session */
-        if (previous_index >= 0 && (unsigned int)previous_index < session_count) {
-            gtk_combo_box_set_active(GTK_COMBO_BOX(dashboard->stats_session_combo), previous_index);
-        } else {
-            gtk_combo_box_set_active(GTK_COMBO_BOX(dashboard->stats_session_combo), 0);
-        }
-
-        /* Get the currently selected session */
-        gint selected_index = gtk_combo_box_get_active(GTK_COMBO_BOX(dashboard->stats_session_combo));
-        if (selected_index < 0 || (unsigned int)selected_index >= session_count) {
-            selected_index = 0;
-        }
-        VpnSession *active_session = sessions[selected_index];
-
-        /* Update duration */
-        time_t now = time(NULL);
-        time_t elapsed = now - (time_t)active_session->session_created;
-        char elapsed_str[32];
-        format_elapsed_time(elapsed, elapsed_str, sizeof(elapsed_str));
-        char duration_text[64];
-        snprintf(duration_text, sizeof(duration_text), "Duration: %s", elapsed_str);
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_duration_label), duration_text);
-
-        /* Create or recreate bandwidth monitor if device changed */
-        if (!dashboard->bandwidth_monitor ||
-            !dashboard->current_device ||
-            strcmp(dashboard->current_device, active_session->device_name) != 0) {
-
-            /* Free old monitor */
-            if (dashboard->bandwidth_monitor) {
-                bandwidth_monitor_free(dashboard->bandwidth_monitor);
+            if (!session->device_name || !session->session_path) {
+                continue;  /* Skip sessions without device */
             }
-            free(dashboard->current_device);
 
-            /* Create new monitor */
-            printf("Dashboard: Creating bandwidth monitor for device '%s'\n", active_session->device_name);
-            dashboard->bandwidth_monitor = bandwidth_monitor_create(
-                active_session->session_path,
-                active_session->device_name,
-                STATS_SOURCE_AUTO,  /* Try D-Bus first, fallback to sysfs */
-                60  /* 60-second buffer */
+            /* Get or create bandwidth monitor for this session */
+            BandwidthMonitor *monitor = g_hash_table_lookup(
+                dashboard->bandwidth_monitors,
+                session->session_path
             );
-            dashboard->current_device = strdup(active_session->device_name);
-            if (dashboard->bandwidth_monitor) {
-                printf("Dashboard: Bandwidth monitor created successfully\n");
-            } else {
-                printf("Dashboard: Failed to create bandwidth monitor\n");
-            }
-        }
 
-        /* Update bandwidth monitor */
-        if (dashboard->bandwidth_monitor) {
-            int r = bandwidth_monitor_update(dashboard->bandwidth_monitor, bus);
-            if (r < 0) {
-                printf("Dashboard: Failed to update bandwidth monitor: %d\n", r);
-            }
+            if (!monitor) {
+                /* Create new monitor */
+                printf("Dashboard: Creating bandwidth monitor for session %s (device: %s)\n",
+                       session->config_name ? session->config_name : "unknown",
+                       session->device_name);
 
-            /* Get current rate */
-            BandwidthRate rate;
-            BandwidthSample sample;
-            char text[256];
+                monitor = bandwidth_monitor_create(
+                    session->session_path,
+                    session->device_name,
+                    STATS_SOURCE_AUTO,
+                    7200  /* 2-hour buffer (7200 seconds) */
+                );
 
-            int rate_result = bandwidth_monitor_get_rate(dashboard->bandwidth_monitor, &rate);
-            if (rate_result >= 0) {
-                printf("Dashboard: Rates - Upload: %.0f B/s, Download: %.0f B/s, Total Up: %lu, Total Down: %lu\n",
-                       rate.upload_rate_bps, rate.download_rate_bps,
-                       rate.total_uploaded, rate.total_downloaded);
-
-                /* Update upload rate */
-                format_bytes((uint64_t)rate.upload_rate_bps, text, sizeof(text));
-                char label_text[256];
-                snprintf(label_text, sizeof(label_text), "  ▲ Upload:   %s/s", text);
-                gtk_label_set_text(GTK_LABEL(dashboard->stats_upload_label), label_text);
-
-                /* Update download rate */
-                format_bytes((uint64_t)rate.download_rate_bps, text, sizeof(text));
-                snprintf(label_text, sizeof(label_text), "  ▼ Download: %s/s", text);
-                gtk_label_set_text(GTK_LABEL(dashboard->stats_download_label), label_text);
-
-                /* Update total uploaded */
-                format_bytes(rate.total_uploaded, text, sizeof(text));
-                snprintf(label_text, sizeof(label_text), "<b>%s</b>", text);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_total_uploaded_label), label_text);
-
-                /* Update total downloaded */
-                format_bytes(rate.total_downloaded, text, sizeof(text));
-                snprintf(label_text, sizeof(label_text), "<b>%s</b>", text);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_total_downloaded_label), label_text);
-
-                /* Update total combined */
-                format_bytes(rate.total_uploaded + rate.total_downloaded, text, sizeof(text));
-                snprintf(label_text, sizeof(label_text), "<b>%s</b>", text);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_total_combined_label), label_text);
-            } else {
-                printf("Dashboard: Not enough samples yet to calculate rate (result: %d)\n", rate_result);
+                if (monitor) {
+                    g_hash_table_insert(
+                        dashboard->bandwidth_monitors,
+                        g_strdup(session->session_path),
+                        monitor
+                    );
+                    printf("Dashboard: Bandwidth monitor created successfully\n");
+                } else {
+                    printf("Dashboard: Failed to create bandwidth monitor\n");
+                    continue;
+                }
             }
 
-            if (bandwidth_monitor_get_latest_sample(dashboard->bandwidth_monitor, &sample) >= 0) {
+            /* Update the monitor */
+            bandwidth_monitor_update(monitor, bus);
+
+            /* Create stat card for this session */
+            GtkWidget *card = create_vpn_stat_card(dashboard, session, monitor);
+            if (card) {
+                gtk_container_add(GTK_CONTAINER(dashboard->stats_flowbox), card);
+
+                /* Update card with live data */
+                BandwidthRate rate;
+                if (bandwidth_monitor_get_rate(monitor, &rate) >= 0) {
+                    /* Update throughput labels */
+                    GtkWidget *download_label = g_object_get_data(G_OBJECT(card), "download-label");
+                    GtkWidget *upload_label = g_object_get_data(G_OBJECT(card), "upload-label");
+
+                    if (download_label && upload_label) {
+                        char text[256];
+                        format_bytes((uint64_t)rate.download_rate_bps, text, sizeof(text));
+                        char label_text[256];
+                        snprintf(label_text, sizeof(label_text), "↓ %s/s", text);
+                        gtk_label_set_text(GTK_LABEL(download_label), label_text);
+
+                        format_bytes((uint64_t)rate.upload_rate_bps, text, sizeof(text));
+                        snprintf(label_text, sizeof(label_text), "↑ %s/s", text);
+                        gtk_label_set_text(GTK_LABEL(upload_label), label_text);
+                    }
+                }
+
                 /* Update packet statistics */
-                char label_text[256];
-                snprintf(label_text, sizeof(label_text), "<b>%lu packets</b>", sample.packets_out);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_packets_sent_label), label_text);
+                BandwidthSample sample;
+                if (bandwidth_monitor_get_latest_sample(monitor, &sample) >= 0) {
+                    GtkWidget *sent_label = g_object_get_data(G_OBJECT(card), "sent-label");
+                    GtkWidget *received_label = g_object_get_data(G_OBJECT(card), "received-label");
+                    GtkWidget *errors_label = g_object_get_data(G_OBJECT(card), "errors-label");
 
-                snprintf(label_text, sizeof(label_text), "<b>%lu packets</b>", sample.packets_in);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_packets_received_label), label_text);
+                    if (sent_label) {
+                        char label_text[256];
+                        snprintf(label_text, sizeof(label_text), "Sent:     %lu", sample.packets_out);
+                        gtk_label_set_text(GTK_LABEL(sent_label), label_text);
+                    }
+                    if (received_label) {
+                        char label_text[256];
+                        snprintf(label_text, sizeof(label_text), "Received: %lu", sample.packets_in);
+                        gtk_label_set_text(GTK_LABEL(received_label), label_text);
+                    }
+                    if (errors_label) {
+                        char label_text[256];
+                        snprintf(label_text, sizeof(label_text), "Errors:   %lu",
+                                sample.errors_in + sample.errors_out);
+                        gtk_label_set_text(GTK_LABEL(errors_label), label_text);
+                    }
+                }
 
-                snprintf(label_text, sizeof(label_text), "<b>%lu</b>", sample.errors_in + sample.errors_out);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_packets_errors_label), label_text);
-
-                snprintf(label_text, sizeof(label_text), "<b>%lu</b>", sample.dropped_in + sample.dropped_out);
-                gtk_label_set_markup(GTK_LABEL(dashboard->stats_packets_dropped_label), label_text);
+                /* Queue redraw for sparkline graph */
+                GtkWidget *graph_area = g_object_get_data(G_OBJECT(card), "graph-area");
+                if (graph_area) {
+                    gtk_widget_queue_draw(graph_area);
+                }
             }
-
-            /* Redraw bandwidth graph */
-            if (dashboard->stats_graph_area) {
-                gtk_widget_queue_draw(dashboard->stats_graph_area);
-            }
         }
 
-        /* Update connection details */
-        char detail_text[256];
-
-        /* Protocol - extract from session if available */
-        snprintf(detail_text, sizeof(detail_text), "Protocol: %s",
-                active_session->device_name ? "UDP" : "--");  /* TODO: Get actual protocol from D-Bus */
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_protocol_label), detail_text);
-
-        /* Cipher */
-        snprintf(detail_text, sizeof(detail_text), "Cipher:   AES-256-GCM");  /* TODO: Get actual cipher from D-Bus */
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_cipher_label), detail_text);
-
-        /* Server */
-        snprintf(detail_text, sizeof(detail_text), "Server:   %s",
-                active_session->config_name ? active_session->config_name : "--");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_server_label), detail_text);
-
-        /* Local IP */
-        char local_ip[64];
-        if (active_session->device_name &&
-            get_interface_ip(active_session->device_name, local_ip, sizeof(local_ip)) == 0) {
-            snprintf(detail_text, sizeof(detail_text), "Local IP: %s", local_ip);
-        } else {
-            snprintf(detail_text, sizeof(detail_text), "Local IP: --");
-        }
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_local_ip_label), detail_text);
-
-        /* Gateway */
-        char gateway[64];
-        if (active_session->device_name &&
-            get_interface_gateway(active_session->device_name, gateway, sizeof(gateway)) == 0) {
-            snprintf(detail_text, sizeof(detail_text), "Gateway:  %s", gateway);
-        } else {
-            snprintf(detail_text, sizeof(detail_text), "Gateway:  --");
-        }
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_gateway_label), detail_text);
-
+        gtk_widget_show_all(dashboard->stats_flowbox);
     } else {
         /* No active sessions - show empty state */
-        gtk_widget_hide(dashboard->stats_content_box);
         gtk_widget_show(dashboard->stats_empty_state);
-
-        /* Reset session combo box */
-        gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(dashboard->stats_session_combo));
-        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(dashboard->stats_session_combo), "No active sessions");
-        gtk_combo_box_set_active(GTK_COMBO_BOX(dashboard->stats_session_combo), 0);
-
-        /* Reset duration label */
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_duration_label), "Duration: --");
-
-        if (dashboard->bandwidth_monitor) {
-            bandwidth_monitor_free(dashboard->bandwidth_monitor);
-            dashboard->bandwidth_monitor = NULL;
-        }
-        free(dashboard->current_device);
-        dashboard->current_device = NULL;
-
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_upload_label), "  ▲ Upload:   0 B/s");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_download_label), "  ▼ Download: 0 B/s");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_total_uploaded_label), "0 B");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_total_downloaded_label), "0 B");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_total_combined_label), "0 B");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_packets_sent_label), "0 packets");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_packets_received_label), "0 packets");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_packets_errors_label), "0");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_packets_dropped_label), "0");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_protocol_label), "Protocol: --");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_cipher_label), "Cipher:   --");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_server_label), "Server:   --");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_local_ip_label), "Local IP: --");
-        gtk_label_set_text(GTK_LABEL(dashboard->stats_gateway_label), "Gateway:  --");
     }
 
     /* Free sessions after we're done using them */
@@ -1604,11 +1336,11 @@ void dashboard_destroy(Dashboard *dashboard) {
         return;
     }
 
-    /* Clean up bandwidth monitor */
-    if (dashboard->bandwidth_monitor) {
-        bandwidth_monitor_free(dashboard->bandwidth_monitor);
+    /* Clean up bandwidth monitors hash table */
+    if (dashboard->bandwidth_monitors) {
+        g_hash_table_destroy(dashboard->bandwidth_monitors);
+        dashboard->bandwidth_monitors = NULL;
     }
-    free(dashboard->current_device);
 
     /* Clean up servers tab */
     if (dashboard->servers_tab_instance) {
