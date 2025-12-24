@@ -1,0 +1,258 @@
+# GitHub Actions Release Workflow for OpenVPN3 Manager
+# Triggers on version tags (v*.*.*) and creates GitHub releases with .deb packages
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Semantic versioning: v1.0.0, v2.1.3, etc.
+
+permissions:
+  contents: write  # Required for creating releases
+
+env:
+  APP_NAME: ovpn-manager
+
+jobs:
+  #
+  # Build binaries for both Debian versions
+  #
+  build:
+    name: Build - Debian ${{ matrix.debian }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - debian: "12"
+            image: "debian:12"
+          - debian: "13"
+            image: "debian:trixie"
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version ${VERSION} for Debian ${{ matrix.debian }}"
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq \
+            build-essential \
+            pkg-config \
+            python3 \
+            python3-pip \
+            ninja-build \
+            libglib2.0-dev \
+            libsystemd-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libcairo2-dev
+          pip3 install --quiet --break-system-packages meson
+
+      - name: Configure build
+        run: |
+          meson setup builddir --buildtype=release --prefix=/usr
+
+      - name: Build
+        run: |
+          ninja -C builddir
+          strip builddir/src/ovpn-manager
+          ls -lh builddir/src/ovpn-manager
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-debian${{ matrix.debian }}
+          path: builddir/src/ovpn-manager
+          retention-days: 1
+
+  #
+  # Create .deb packages
+  #
+  package:
+    name: Package - Debian ${{ matrix.debian }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - debian: "12"
+            image: "debian:12"
+          - debian: "13"
+            image: "debian:trixie"
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install packaging tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq dpkg-dev fakeroot
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-debian${{ matrix.debian }}
+          path: builddir/src/
+
+      - name: Make binary executable
+        run: chmod +x builddir/src/ovpn-manager
+
+      - name: Create .deb package
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          PACKAGE_NAME="${APP_NAME}_${VERSION}_debian${{ matrix.debian }}_amd64"
+
+          echo "Creating package: ${PACKAGE_NAME}.deb"
+
+          # Create package directory structure
+          mkdir -p debian-package/DEBIAN
+          mkdir -p debian-package/usr/bin
+          mkdir -p debian-package/etc/xdg/autostart
+
+          # Copy files
+          cp builddir/src/ovpn-manager debian-package/usr/bin/
+          cp data/ovpn-manager.desktop debian-package/etc/xdg/autostart/
+
+          # Create control file
+          cat > debian-package/DEBIAN/control <<EOF
+          Package: ovpn-manager
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Depends: libglib2.0-0, libgtk-3-0, libsystemd0, libayatana-appindicator3-1, libcairo2, openvpn3
+          Maintainer: Renny Koshy <renny@koshy.org>
+          Homepage: https://github.com/rennykoshy/ovpn-tool
+          Description: Professional GTK3-based VPN client for OpenVPN3
+           Lightweight, event-driven VPN manager with real-time monitoring,
+           server selection, and advanced features for power users.
+          EOF
+
+          # Build package
+          fakeroot dpkg-deb --build debian-package
+          mv debian-package.deb ${PACKAGE_NAME}.deb
+
+          # Show package info
+          dpkg-deb --info ${PACKAGE_NAME}.deb
+
+          # Generate checksum
+          sha256sum ${PACKAGE_NAME}.deb > ${PACKAGE_NAME}.deb.sha256
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-debian${{ matrix.debian }}
+          path: |
+            *.deb
+            *.sha256
+          retention-days: 1
+
+  #
+  # Create GitHub Release with all artifacts
+  #
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: package
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          # Check if this is a pre-release
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release assets
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p release-assets
+
+          # Copy and rename binaries
+          cp artifacts/binary-debian12/ovpn-manager release-assets/ovpn-manager-${VERSION}-debian12-linux-amd64
+          cp artifacts/binary-debian13/ovpn-manager release-assets/ovpn-manager-${VERSION}-debian13-linux-amd64
+
+          # Copy packages and checksums
+          cp artifacts/package-debian12/*.deb release-assets/
+          cp artifacts/package-debian12/*.sha256 release-assets/
+          cp artifacts/package-debian13/*.deb release-assets/
+          cp artifacts/package-debian13/*.sha256 release-assets/
+
+          # Generate checksums for binaries
+          cd release-assets
+          sha256sum ovpn-manager-${VERSION}-debian12-linux-amd64 > ovpn-manager-${VERSION}-debian12-linux-amd64.sha256
+          sha256sum ovpn-manager-${VERSION}-debian13-linux-amd64 > ovpn-manager-${VERSION}-debian13-linux-amd64.sha256
+
+          # Create combined checksum file
+          cat *.sha256 > SHA256SUMS.txt
+
+          echo "Release assets:"
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenVPN3 Manager v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.deb
+            release-assets/*-linux-amd64
+            release-assets/SHA256SUMS.txt
+          body: |
+            ## Installation
+
+            ### Debian 12 (Bookworm)
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ovpn-manager_${{ steps.version.outputs.version }}_debian12_amd64.deb
+            sudo dpkg -i ovpn-manager_${{ steps.version.outputs.version }}_debian12_amd64.deb
+            sudo apt-get install -f  # Install any missing dependencies
+            ```
+
+            ### Debian 13 (Trixie)
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ovpn-manager_${{ steps.version.outputs.version }}_debian13_amd64.deb
+            sudo dpkg -i ovpn-manager_${{ steps.version.outputs.version }}_debian13_amd64.deb
+            sudo apt-get install -f  # Install any missing dependencies
+            ```
+
+            ### Verify Download
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ---
